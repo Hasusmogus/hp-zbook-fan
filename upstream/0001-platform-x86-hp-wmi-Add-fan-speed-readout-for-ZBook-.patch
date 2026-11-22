@@ -1,0 +1,234 @@
+From 9f42a261f2011fb66d86551c131add1fcb15b9f4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Hasan-H=C3=BCseyin=20Kayisci?= <kayiscihasan@gmail.com>
+Date: Sun, 22 Nov 2026 16:20:30 +0100
+Subject: [PATCH 1/2] platform/x86: hp-wmi: Add fan speed readout for ZBook
+ Studio G8
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+To: platform-driver-x86@vger.kernel.org,
+    Hans de Goede <hansg@kernel.org>,
+    Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Cc: linux-kernel@vger.kernel.org
+
+The HP ZBook Studio G8 (board 8873) doesn't support the gaming notebook
+fan WMI commands, so the hwmon device registered by hp-wmi exposes no
+fan speed at all, only a pwm1_enable attribute that fails with -EINVAL.
+
+Its firmware does report fan tachometer readings through the thermal
+status query (0x28, page 0x07), which returns a 16-bit tachometer period
+for each fan starting at byte 2. Convert the period to RPM the same way
+the firmware's own \_TZ.GFRM method does.
+
+Byte 0 of the reply is the index of the last fan with a non-zero
+reading rather than a fan count, so take the fan count from the board
+data instead. The firmware rejects the query unless the input size is
+exactly 4 bytes.
+
+Add a fan_count field to the fan profile parameters so boards can
+provide a static fan count, and only treat a board as supporting manual
+fan control when it also has a fan table, which this board doesn't.
+
+Tested on a ZBook Studio G8 with BIOS T92 01.25.00: fan1_input and
+fan2_input match the values from the EC tachometer registers.
+
+This patch was written with the help of an AI coding assistant (Claude
+Opus 5.5, via Claude Code), which disassembled the DSDT, probed the
+firmware interfaces, and drafted the code and this changelog. All of it
+was reviewed and tested on hardware by the submitter.
+
+Signed-off-by: Hasan-Hüseyin Kayisci <kayiscihasan@gmail.com>
+---
+ drivers/platform/x86/hp/hp-wmi.c | 96 +++++++++++++++++++++++++++-----
+ 1 file changed, 82 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/platform/x86/hp/hp-wmi.c b/drivers/platform/x86/hp/hp-wmi.c
+index 0069af868..c4896435c 100644
+--- a/drivers/platform/x86/hp/hp-wmi.c
++++ b/drivers/platform/x86/hp/hp-wmi.c
+@@ -39,6 +39,7 @@
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
++#include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ 
+ #include <acpi/battery.h>
+@@ -148,6 +149,8 @@ static const struct thermal_profile_params omen_v1_no_ec_thermal_params = {
+ 
+ struct hp_wmi_fan_profile_params {
+ 	int (*get_fan_speed)(int fan);
++	/* Number of fans, 0 to query it with HPWMI_FAN_COUNT_GET_QUERY */
++	int fan_count;
+ 	bool fan_table;
+ };
+ 
+@@ -183,6 +186,21 @@ static const struct hp_wmi_board_params omen_v1_no_ec_board_params = {
+ 	.fan_profile		= &victus_s_fan_profile_params,
+ };
+ 
++static int hp_wmi_get_fan_speed_thermal_status(int fan);
++
++/*
++ * Business notebooks (e.g. ZBook) without the gaming fan commands, which
++ * report fan tachometer readings through the thermal status query.
++ */
++static const struct hp_wmi_fan_profile_params thermal_status_fan_profile_params = {
++	.get_fan_speed	= hp_wmi_get_fan_speed_thermal_status,
++	.fan_count	= 2,
++};
++
++static const struct hp_wmi_board_params thermal_status_board_params = {
++	.fan_profile		= &thermal_status_fan_profile_params,
++};
++
+ static const struct hp_wmi_board_params *active_board_params;
+ 
+ static const struct thermal_profile_params *hp_wmi_thermal_profile(void)
+@@ -243,8 +261,13 @@ static const char * const victus_thermal_profile_boards[] = {
+ 	"8A26",
+ };
+ 
+-/* DMI board-specific feature data for Omen and Victus laptops. */
++/* DMI board-specific feature data for Omen, Victus and ZBook laptops. */
+ static const struct dmi_system_id hp_wmi_feature_boards[] __initconst = {
++	{
++		/* HP ZBook Studio 15.6 inch G8 Mobile Workstation PC */
++		.matches = { DMI_MATCH(DMI_BOARD_NAME, "8873") },
++		.driver_data = (void *)&thermal_status_board_params,
++	},
+ 	{
+ 		.matches = { DMI_MATCH(DMI_BOARD_NAME, "8902") },
+ 		.driver_data = (void *)&omen_v1_legacy_board_params,
+@@ -437,6 +460,7 @@ enum hp_wmi_commandtype {
+ 	HPWMI_HOTKEY_QUERY		= 0x0c,
+ 	HPWMI_FEATURE2_QUERY		= 0x0d,
+ 	HPWMI_WIRELESS2_QUERY		= 0x1b,
++	HPWMI_THERMAL_STATUS_QUERY	= 0x28,
+ 	HPWMI_POSTCODEERROR_QUERY	= 0x2a,
+ 	HPWMI_BATTERY_CHARGE_MODE	= 0x2b,
+ 	HPWMI_SYSTEM_DEVICE_MODE	= 0x40,
+@@ -856,6 +880,43 @@ static int hp_wmi_get_fan_speed_victus_s(int fan)
+ 	return fan_data[fan] * 100;
+ }
+ 
++/*
++ * Thermal status query, fan tachometer page. The output holds a 16-bit
++ * tachometer period per fan starting at byte 2. Byte 0 is the index of the
++ * last fan with a non-zero reading, so it can't be used as the fan count.
++ * The period is converted to RPM the same way the firmware does in its own
++ * \_TZ fan speed methods.
++ */
++#define HP_THERMAL_STATUS_FAN_TACH	0x07
++#define HP_THERMAL_STATUS_TACH_OFFSET	2
++#define HP_THERMAL_STATUS_MAX_FANS	2
++#define HP_FAN_TACH_PERIOD_TO_RPM	0x3c000
++
++static int hp_wmi_get_fan_speed_thermal_status(int fan)
++{
++	u8 data[128] = { HP_THERMAL_STATUS_FAN_TACH };
++	int ret, offset;
++	u16 period;
++
++	if (fan < 0 || fan >= HP_THERMAL_STATUS_MAX_FANS)
++		return -EINVAL;
++
++	/* The firmware rejects any input size other than 4 bytes */
++	ret = hp_wmi_perform_query(HPWMI_THERMAL_STATUS_QUERY, HPWMI_READ,
++				   data, sizeof(u32), sizeof(data));
++	if (ret)
++		return ret < 0 ? ret : -EINVAL;
++
++	offset = HP_THERMAL_STATUS_TACH_OFFSET + fan * sizeof(period);
++	period = get_unaligned_le16(&data[offset]);
++
++	/* A stopped fan reports an empty period */
++	if (!period)
++		return 0;
++
++	return DIV_ROUND_CLOSEST(HP_FAN_TACH_PERIOD_TO_RPM, period);
++}
++
+ static int hp_wmi_read_int(int query)
+ {
+ 	int val = 0, ret;
+@@ -2271,7 +2332,7 @@ static bool hp_wmi_fan_control_supported(void)
+ {
+ 	const struct hp_wmi_fan_profile_params *params = hp_wmi_fan_profile();
+ 
+-	return params && params->get_fan_speed;
++	return params && params->get_fan_speed && params->fan_table;
+ }
+ 
+ static bool hp_wmi_fan_table_supported(void)
+@@ -2291,6 +2352,16 @@ static int hp_wmi_get_active_fan_speed(int fan)
+ 	return params->get_fan_speed(fan);
+ }
+ 
++static int hp_wmi_read_fan_speed(int fan)
++{
++	const struct hp_wmi_fan_profile_params *params = hp_wmi_fan_profile();
++
++	if (params && params->get_fan_speed)
++		return params->get_fan_speed(fan);
++
++	return hp_wmi_get_fan_speed(fan);
++}
++
+ static int victus_s_gpu_thermal_profile_get(bool *ctgp_enable,
+ 					    bool *ppab_enable,
+ 					    u8 *dstate,
+@@ -2963,13 +3034,8 @@ static umode_t hp_wmi_hwmon_is_visible(const void *data,
+ 	case hwmon_fan:
+ 		if (priv->fan_count <= 0)
+ 			return 0;
+-		if (hp_wmi_fan_control_supported()) {
+-			if (hp_wmi_get_active_fan_speed(channel) >= 0)
+-				return 0444;
+-		} else {
+-			if (hp_wmi_get_fan_speed(channel) >= 0)
+-				return 0444;
+-		}
++		if (hp_wmi_read_fan_speed(channel) >= 0)
++			return 0444;
+ 		break;
+ 	default:
+ 		return 0;
+@@ -2988,10 +3054,7 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+ 	priv = dev_get_drvdata(dev);
+ 	switch (type) {
+ 	case hwmon_fan:
+-		if (hp_wmi_fan_control_supported())
+-			ret = hp_wmi_get_active_fan_speed(channel);
+-		else
+-			ret = hp_wmi_get_fan_speed(channel);
++		ret = hp_wmi_read_fan_speed(channel);
+ 		if (ret < 0)
+ 			return ret;
+ 		*val = ret;
+@@ -3122,6 +3185,7 @@ static void hp_wmi_hwmon_keep_alive_handler(struct work_struct *work)
+ 
+ static int hp_wmi_setup_fan_settings(struct hp_wmi_hwmon_priv *priv)
+ {
++	const struct hp_wmi_fan_profile_params *params;
+ 	u8 fan_data[128] = { 0 };
+ 	struct victus_s_fan_table *fan_table;
+ 	u8 min_rpm, max_rpm;
+@@ -3131,7 +3195,11 @@ static int hp_wmi_setup_fan_settings(struct hp_wmi_hwmon_priv *priv)
+ 
+ 	/* Default behaviour on hwmon init is automatic mode */
+ 	priv->mode = PWM_MODE_AUTO;
+-	priv->fan_count = hp_wmi_get_fan_count_userdefine_trigger();
++	params = hp_wmi_fan_profile();
++	if (params && params->fan_count)
++		priv->fan_count = params->fan_count;
++	else
++		priv->fan_count = hp_wmi_get_fan_count_userdefine_trigger();
+ 
+ 	/* Bypass devices without fan control support. */
+ 	if (!hp_wmi_fan_table_supported())
+
+base-commit: 9c82959c37bf69c2ace8a0f975cf2129ec1fd982
+-- 
+2.56.1
+

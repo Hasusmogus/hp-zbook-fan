@@ -4,6 +4,17 @@ Linux hwmon driver for the fans on the **HP ZBook Studio G8** (board ID `8873`).
 
 Stock Linux shows nothing useful here. `hp-wmi` exposes only `pwm1_enable`, and the firmware rejects every value with `EINVAL`. No fan RPM is visible at all.
 
+## Upstream status
+
+The same support has been submitted to the mainline kernel as a two-patch series for the in-tree `hp-wmi` driver. It went to the platform/x86 maintainers and mailing list on 2026-11-22 and is **awaiting review**. The patches are in [`upstream/`](upstream/):
+
+1. **`platform/x86: hp-wmi: Add fan speed readout for ZBook Studio G8`**: `fan1_input`/`fan2_input` on hp-wmi's hwmon device. It reads the speeds through the firmware's thermal status WMI query (0x28, page 7) instead of raw EC registers.
+2. **`platform/x86: hp-wmi: Support max fan mode on ZBook Studio G8`**: makes the standard `pwm1_enable` work, with `0` = full speed (fan mode 1) and `2` = automatic. It writes the same EC fan mode register this driver uses.
+
+The upstream version deliberately leaves out mode 2 ("elevated"), because it has no standard hwmon equivalent. It also leaves out `fanN_target`.
+
+Track the series on [lore.kernel.org](https://lore.kernel.org/platform-driver-x86/?q=ZBook+Studio+G8). Once it reaches your distribution's kernel, uninstall this module (`sudo dkms remove hp-zbook-fan/1.0 --all`) and use `hp-wmi` instead. Until then, this driver is the way to get fan readings and mode control.
+
 ## What it provides
 
 `sensors` (lm_sensors) and other hwmon tools pick up these files:

@@ -1,0 +1,123 @@
+From ef7aa9583e48f9373ff570f0ab8809d297e40f98 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Hasan-H=C3=BCseyin=20Kayisci?= <kayiscihasan@gmail.com>
+Date: Sun, 22 Nov 2026 16:25:04 +0100
+Subject: [PATCH 2/2] platform/x86: hp-wmi: Support max fan mode on ZBook
+ Studio G8
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+To: platform-driver-x86@vger.kernel.org,
+    Hans de Goede <hansg@kernel.org>,
+    Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Cc: linux-kernel@vger.kernel.org
+
+On the ZBook Studio G8 the HPWMI_FAN_SPEED_MAX_SET_QUERY command fails,
+so writing pwm1_enable fails with -EINVAL and hwmon init logs "Failed
+to apply initial fan settings: -22".
+
+The EC on this board has a fan mode register at offset 0x2d, which the
+DPTF IETM.IMOK method writes on Windows. The low nibble selects the mode
+for the CPU fan and the high nibble for the GPU fan. Mode 0 is the
+automatic fan curve and mode 1 holds the fans at the highest fixed
+level the EC offers (about 4700 RPM on this machine, versus about 4100
+RPM reached in automatic mode under sustained full CPU load). The EC
+also accepts mode 2, a lower fixed level, which has no hwmon
+equivalent and isn't exposed. Writes of other values are ignored.
+
+Add an optional set_fan_speed_max callback to the fan profile
+parameters and implement it for this board by writing the EC fan mode
+register, so pwm1_enable 0 (full speed) and 2 (automatic) work. Manual
+control (pwm1_enable 1) stays unsupported: the EC ignores host writes to
+its fan target registers.
+
+Tested on a ZBook Studio G8 with BIOS T92 01.25.00.
+
+This patch was written with the help of an AI coding assistant (Claude
+Opus 5.5, via Claude Code), which found the register by disassembling
+the DSDT and probing the EC, and drafted the code and this changelog.
+All of it was reviewed and tested on hardware by the submitter.
+
+Signed-off-by: Hasan-Hüseyin Kayisci <kayiscihasan@gmail.com>
+---
+ drivers/platform/x86/hp/hp-wmi.c | 34 ++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/platform/x86/hp/hp-wmi.c b/drivers/platform/x86/hp/hp-wmi.c
+index c4896435c..9e1729af4 100644
+--- a/drivers/platform/x86/hp/hp-wmi.c
++++ b/drivers/platform/x86/hp/hp-wmi.c
+@@ -63,6 +63,15 @@ enum hp_ec_offsets {
+ 	HP_OMEN_EC_THERMAL_PROFILE_OFFSET		= 0x95,
+ };
+ 
++/*
++ * EC fan mode register on ZBook boards, also written by the DPTF IETM.IMOK
++ * method. Low nibble is the CPU fan, high nibble the GPU fan. 0 selects the
++ * automatic fan curve, 1 the highest fixed fan level.
++ */
++#define HP_EC_FAN_MODE_OFFSET	0x2d
++#define HP_EC_FAN_MODE_AUTO	0x00
++#define HP_EC_FAN_MODE_MAX	0x11
++
+ #define HP_FAN_SPEED_AUTOMATIC	 0x00
+ #define HP_POWER_LIMIT_DEFAULT	 0x00
+ #define HP_POWER_LIMIT_NO_CHANGE 0xFF
+@@ -151,6 +160,8 @@ struct hp_wmi_fan_profile_params {
+ 	int (*get_fan_speed)(int fan);
+ 	/* Number of fans, 0 to query it with HPWMI_FAN_COUNT_GET_QUERY */
+ 	int fan_count;
++	/* Optional, defaults to HPWMI_FAN_SPEED_MAX_SET_QUERY */
++	int (*set_fan_speed_max)(int enabled);
+ 	bool fan_table;
+ };
+ 
+@@ -187,14 +198,17 @@ static const struct hp_wmi_board_params omen_v1_no_ec_board_params = {
+ };
+ 
+ static int hp_wmi_get_fan_speed_thermal_status(int fan);
++static int hp_wmi_ec_fan_speed_max_set(int enabled);
++static const struct hp_wmi_fan_profile_params *hp_wmi_fan_profile(void);
+ 
+ /*
+  * Business notebooks (e.g. ZBook) without the gaming fan commands, which
+  * report fan tachometer readings through the thermal status query.
+  */
+ static const struct hp_wmi_fan_profile_params thermal_status_fan_profile_params = {
+-	.get_fan_speed	= hp_wmi_get_fan_speed_thermal_status,
+-	.fan_count	= 2,
++	.get_fan_speed		= hp_wmi_get_fan_speed_thermal_status,
++	.fan_count		= 2,
++	.set_fan_speed_max	= hp_wmi_ec_fan_speed_max_set,
+ };
+ 
+ static const struct hp_wmi_board_params thermal_status_board_params = {
+@@ -1226,10 +1240,26 @@ static int omen_thermal_profile_get(void)
+ 	return data;
+ }
+ 
++static int hp_wmi_ec_fan_speed_max_set(int enabled)
++{
++	int ret;
++
++	ret = ec_write(HP_EC_FAN_MODE_OFFSET,
++		       enabled ? HP_EC_FAN_MODE_MAX : HP_EC_FAN_MODE_AUTO);
++	if (ret)
++		return ret;
++
++	return enabled;
++}
++
+ static int hp_wmi_fan_speed_max_set(int enabled)
+ {
++	const struct hp_wmi_fan_profile_params *params = hp_wmi_fan_profile();
+ 	int ret;
+ 
++	if (params && params->set_fan_speed_max)
++		return params->set_fan_speed_max(enabled);
++
+ 	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_SET_QUERY, HPWMI_GM,
+ 				   &enabled, sizeof(enabled), 0);
+ 
+-- 
+2.56.1
+

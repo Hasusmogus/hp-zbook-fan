@@ -1,0 +1,56 @@
+From 671ed4ca1e9677fb17f7b5da1b274a5e67bfdd75 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Hasan-H=C3=BCseyin=20Kayisci?= <kayiscihasan@gmail.com>
+Date: Sun, 22 Nov 2026 16:25:56 +0100
+Subject: [PATCH 0/2] platform/x86: hp-wmi: Fan support for HP ZBook Studio G8
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+To: platform-driver-x86@vger.kernel.org,
+    Hans de Goede <hansg@kernel.org>,
+    Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Cc: linux-kernel@vger.kernel.org
+
+On the HP ZBook Studio G8 (board 8873), hp-wmi registers a hwmon device
+that shows no fan speeds and has a pwm1_enable attribute that rejects
+every value, because the board lacks the gaming notebook fan WMI
+commands.
+
+Patch 1 reads fan RPM through the thermal status WMI query (0x28), which
+this firmware implements in its GTMS method.
+
+Patch 2 makes pwm1_enable 0 (full speed) and 2 (automatic) work by
+writing the EC fan mode register the DPTF IETM.IMOK method uses.
+
+Manual PWM control isn't possible on this board. The EC ignores host
+writes to its fan target registers, both directly and through the
+thermal status write path (SetThermalStatus, 0x28 write).
+
+Other ZBook and EliteBook models probably share this firmware interface
+(the same GTMS/STMM methods appear in their DSDTs), but I only have this
+machine, so the support is limited to board 8873 by DMI.
+
+Testing: built with W=1 and tested on the ZBook Studio G8, BIOS
+T92 01.25.00, running 7.3.4. The out-of-tree build used this file from
+for-next with devm_kzalloc_obj() replaced by devm_kzalloc(), which 7.3
+lacks. It hasn't been built inside a full for-next tree.
+
+Tool use: an AI coding assistant (Claude Opus 5.5, via Claude Code)
+did most of this work in one interactive session from the prompt "try
+getting proper fan control through linux working on this HP ZBook Studio
+G8", followed by "do the hp-wmi rework". It disassembled the DSDT,
+probed the EC and WMI interfaces, wrote the code and drafted the
+changelogs. I reviewed the result, tested it on my machine and take
+responsibility for it.
+
+Hasan-Hüseyin Kayisci (2):
+  platform/x86: hp-wmi: Add fan speed readout for ZBook Studio G8
+  platform/x86: hp-wmi: Support max fan mode on ZBook Studio G8
+
+ drivers/platform/x86/hp/hp-wmi.c | 126 +++++++++++++++++++++++++++----
+ 1 file changed, 112 insertions(+), 14 deletions(-)
+
+
+base-commit: 9c82959c37bf69c2ace8a0f975cf2129ec1fd982
+-- 
+2.56.1
+
